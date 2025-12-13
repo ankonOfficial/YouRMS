@@ -1,0 +1,432 @@
+// ============================================
+// Advanced Schedule JSON Extractor
+// ============================================
+
+// Configuration
+const CONFIG = {
+    DOWNLOAD_DELAY: 150, // ms between downloads
+    MIN_COURSE_LENGTH: 3,
+    MAX_RETRIES: 3,
+    DEBUG_MODE: true
+};
+
+// Statistics tracking
+const STATS = {
+    totalRows: 0,
+    processedRows: 0,
+    skippedRows: 0,
+    totalCourses: 0,
+    successfulDownloads: 0,
+    failedDownloads: 0,
+    duplicates: 0,
+    errors: []
+};
+
+// Enhanced logging
+const logger = {
+    info: (msg, data = '') => console.log(`ℹ️ ${msg}`, data),
+    success: (msg, data = '') => console.log(`✅ ${msg}`, data),
+    warning: (msg, data = '') => console.warn(`⚠️ ${msg}`, data),
+    error: (msg, data = '') => console.error(`❌ ${msg}`, data),
+    debug: (msg, data = '') => CONFIG.DEBUG_MODE && console.log(`🔍 ${msg}`, data)
+};
+
+// Download JSON with retry mechanism
+const downloadJson = async (data, filename, delay = 0, retryCount = 0) => {
+    return new Promise((resolve, reject) => {
+        setTimeout(() => {
+            try {
+                // Validate data
+                if (!data || typeof data !== 'object') {
+                    throw new Error('Invalid data format');
+                }
+
+                // Sanitize filename
+                const sanitizedFilename = filename
+                    .replace(/[^a-z0-9\-_.]/gi, '_')
+                    .toLowerCase();
+
+                const jsonStr = JSON.stringify(data, null, 2);
+                const blob = new Blob([jsonStr], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                
+                a.href = url;
+                a.download = sanitizedFilename;
+                
+                document.body.appendChild(a);
+                a.click();
+                
+                // Cleanup
+                setTimeout(() => {
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }, 100);
+
+                logger.success(`Downloaded: ${sanitizedFilename}`);
+                STATS.successfulDownloads++;
+                resolve(true);
+                
+            } catch (error) {
+                logger.error(`Download failed: ${filename}`, error.message);
+                
+                // Retry logic
+                if (retryCount < CONFIG.MAX_RETRIES) {
+                    logger.warning(`Retrying download (${retryCount + 1}/${CONFIG.MAX_RETRIES})...`);
+                    setTimeout(() => {
+                        downloadJson(data, filename, delay, retryCount + 1)
+                            .then(resolve)
+                            .catch(reject);
+                    }, 500);
+                } else {
+                    STATS.failedDownloads++;
+                    STATS.errors.push({ file: filename, error: error.message });
+                    reject(error);
+                }
+            }
+        }, delay);
+    });
+};
+
+// Enhanced course entry parser with multiple patterns
+function parseCourseEntry(text, dayDate, timeSlot) {
+    if (!text || typeof text !== 'string') return null;
+    
+    text = text.trim();
+    if (text.length < CONFIG.MIN_COURSE_LENGTH) return null;
+
+    // Skip invalid entries
+    if (text.match(/^[\-\s]+$/) || text.match(/^day/i)) return null;
+
+    let result = {
+        courseCode: '',
+        section: 'N/A',
+        room: 'N/A',
+        teacher: 'N/A',
+        dayDate: extractDate(dayDate),
+        timeSlot: timeSlot,
+        rawData: text
+    };
+
+    // Pattern 1: Full format with long code (0410-011-1101-2-PA101-ABC)
+    let match = text.match(/(\d{4}-\d{3}-\d{4})[\s\-\/]+(\d+)[\s\-\/]+([A-Z]{1,3}\s?\d{2,4})[\s\-\/]+([A-Z]{2,5}|TBA(?:\s*\(IR\))?)/i);
+    
+    if (match) {
+        result.courseCode = match[1];
+        result.section = match[2];
+        result.room = match[3].replace(/\s/g, '');
+        result.teacher = match[4].trim();
+        logger.debug('Matched Pattern 1 (Long format)', result.courseCode);
+        return result;
+    }
+
+    // Pattern 2: Short code format (CSE 1101-2-PA101-ABC)
+    match = text.match(/([A-Z]{2,4}\s?\d{3,4})[\s\-\/]+(\d+)[\s\-\/]+([A-Z]{1,3}\s?\d{2,4})[\s\-\/]+([A-Z]{2,5}|TBA(?:\s*\(IR\))?)/i);
+    
+    if (match) {
+        result.courseCode = match[1].replace(/\s/g, '');
+        result.section = match[2];
+        result.room = match[3].replace(/\s/g, '');
+        result.teacher = match[4].trim();
+        logger.debug('Matched Pattern 2 (Short format)', result.courseCode);
+        return result;
+    }
+
+    // Pattern 3: Minimal format (CSE 1101 / 2)
+    match = text.match(/([A-Z]{2,4}\s?\d{3,4})[\s\-\/]+(\d+)/i);
+    
+    if (match) {
+        result.courseCode = match[1].replace(/\s/g, '');
+        result.section = match[2];
+        
+        // Extract additional info
+        const remaining = text.replace(match[0], '').trim();
+        const parts = remaining.split(/[\s\-\/]+/).filter(p => p && p.length > 0);
+        
+        if (parts.length >= 1 && parts[0].match(/[A-Z]{1,3}\d{2,4}/i)) {
+            result.room = parts[0];
+        }
+        if (parts.length >= 2) {
+            result.teacher = parts[1];
+        }
+        
+        logger.debug('Matched Pattern 3 (Minimal format)', result.courseCode);
+        return result;
+    }
+
+    // Pattern 4: Very flexible pattern as last resort
+    match = text.match(/([A-Z]+\s*\d+)/i);
+    if (match) {
+        result.courseCode = match[1].replace(/\s/g, '');
+        
+        // Try to extract section number
+        const sectionMatch = text.match(/[\-\/\s](\d{1,3})(?:[\-\/\s]|$)/);
+        if (sectionMatch) {
+            result.section = sectionMatch[1];
+        }
+        
+        logger.debug('Matched Pattern 4 (Flexible)', result.courseCode);
+        return result;
+    }
+
+    logger.debug('No pattern matched', text.substring(0, 50));
+    return null;
+}
+
+// Extract date from day-date string
+function extractDate(dayDate) {
+    if (!dayDate) return 'N/A';
+    
+    const dateMatch = dayDate.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
+    if (dateMatch) return dateMatch[0];
+    
+    return dayDate.trim();
+}
+
+// Extract time slots from table header
+function extractTimeSlots(rows) {
+    const timeSlots = [];
+    const timePattern = /\d+\s*:\s*\d+\s*(?:am|pm)?(?:\s*[-–]\s*\d+\s*:\s*\d+\s*(?:am|pm)?)?/i;
+    
+    // Check first 6 rows for time slots
+    for (let i = 0; i < Math.min(6, rows.length); i++) {
+        const cells = rows[i].querySelectorAll('td, th');
+        
+        for (let j = 0; j < cells.length; j++) {
+            const text = cells[j].textContent.trim();
+            
+            if (timePattern.test(text)) {
+                const cleanTime = text
+                    .replace(/\s*:\s*/g, ':')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                
+                if (!timeSlots.includes(cleanTime) && cleanTime.length > 3) {
+                    timeSlots.push(cleanTime);
+                }
+            }
+        }
+        
+        if (timeSlots.length >= 4) break;
+    }
+    
+    return timeSlots;
+}
+
+// Find day/date columns
+function findDayDateColumns(row) {
+    const cells = row.querySelectorAll('td, th');
+    const dayPattern = /(?:sun|mon|tue|wed|thu|fri|sat|day)/i;
+    const datePattern = /\d{1,2}\/\d{1,2}\/\d{4}/;
+    
+    for (let i = 0; i < Math.min(3, cells.length); i++) {
+        const text = cells[i].textContent.trim();
+        if (dayPattern.test(text) || datePattern.test(text)) {
+            return i;
+        }
+    }
+    
+    return 1; // Default to column 1
+}
+
+// Main extraction function
+const extractAndDownloadSchedule = async () => {
+    try {
+        console.clear();
+        logger.info('🚀 Starting Advanced Schedule Extraction...\n');
+        
+        // Find table
+        const table = document.querySelector('table');
+        if (!table) {
+            throw new Error('Schedule table not found in the document');
+        }
+        
+        const rows = Array.from(table.querySelectorAll('tr'));
+        STATS.totalRows = rows.length;
+        logger.success(`Found table with ${rows.length} rows`);
+
+        // Extract time slots
+        logger.info('⏰ Extracting time slots...');
+        let timeSlots = extractTimeSlots(rows);
+        
+        if (timeSlots.length === 0) {
+            logger.warning('Using default time slots');
+            timeSlots = ['8:00am-10:00am', '10:15am-12:15pm', '1:00pm-3:00pm', '3:15pm-5:15pm'];
+        }
+        
+        logger.success(`Found ${timeSlots.length} time slots`, timeSlots);
+
+        // Storage for courses
+        const allCourses = {};
+        let currentDayDate = '';
+        const dayColIndex = findDayDateColumns(rows[0]);
+        
+        logger.info(`📝 Processing rows (Day column: ${dayColIndex})...\n`);
+
+        // Process each row
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const cells = Array.from(row.querySelectorAll('td, th'));
+
+            if (cells.length < 3) {
+                STATS.skippedRows++;
+                continue;
+            }
+
+            // Update current day/date
+            if (cells[dayColIndex]) {
+                const dayText = cells[dayColIndex].textContent.trim();
+                if (dayText && (dayText.match(/\d{1,2}\/\d{1,2}\/\d{4}/) || 
+                    dayText.match(/(?:sun|mon|tue|wed|thu|fri|sat)/i))) {
+                    currentDayDate = dayText.replace(/\s+/g, ' ').trim();
+                    logger.debug(`Day updated: ${currentDayDate}`);
+                }
+            }
+
+            // Process time slot cells
+            for (let slotIdx = 0; slotIdx < timeSlots.length; slotIdx++) {
+                const cellIdx = slotIdx + 2; // Assuming first 2 cols are for day info
+                
+                if (cells.length <= cellIdx) continue;
+                
+                const cell = cells[cellIdx];
+                const timeSlot = timeSlots[slotIdx];
+
+                // Extract entries from cell
+                const htmlContent = cell.innerHTML;
+                const textContent = cell.textContent.trim();
+
+                if (!textContent || textContent.length < CONFIG.MIN_COURSE_LENGTH) continue;
+
+                // Split by breaks
+                const entries = htmlContent
+                    .split(/<br\s*\/?>/gi)
+                    .map(e => e.replace(/<[^>]*>/g, '').trim())
+                    .filter(e => e.length >= CONFIG.MIN_COURSE_LENGTH);
+
+                if (entries.length === 0 && textContent.length >= CONFIG.MIN_COURSE_LENGTH) {
+                    entries.push(textContent);
+                }
+
+                // Parse each entry
+                for (const entry of entries) {
+                    try {
+                        const parsed = parseCourseEntry(entry, currentDayDate, timeSlot);
+                        
+                        if (parsed && parsed.courseCode) {
+                            const key = `${parsed.courseCode}-${parsed.section}`.toUpperCase();
+                            
+                            if (!allCourses[key]) {
+                                allCourses[key] = {
+                                    courseCode: parsed.courseCode.toUpperCase(),
+                                    section: parsed.section,
+                                    entries: []
+                                };
+                                STATS.totalCourses++;
+                            } else {
+                                STATS.duplicates++;
+                            }
+                            
+                            allCourses[key].entries.push({
+                                room: parsed.room,
+                                teacher: parsed.teacher,
+                                dayDate: parsed.dayDate,
+                                timeSlot: parsed.timeSlot,
+                                rawData: parsed.rawData
+                            });
+                        }
+                    } catch (error) {
+                        logger.error(`Error parsing entry: ${entry.substring(0, 30)}`, error.message);
+                        STATS.errors.push({ entry, error: error.message });
+                    }
+                }
+            }
+
+            STATS.processedRows++;
+            
+            // Progress indicator
+            if (i % 10 === 0 && i > 0) {
+                logger.debug(`Progress: ${i}/${rows.length} rows processed`);
+            }
+        }
+
+        // Summary before download
+        console.log('\n' + '='.repeat(50));
+        logger.success(`Processing Complete!`);
+        logger.info(`Total Rows: ${STATS.totalRows}`);
+        logger.info(`Processed Rows: ${STATS.processedRows}`);
+        logger.info(`Skipped Rows: ${STATS.skippedRows}`);
+        logger.info(`Unique Courses Found: ${STATS.totalCourses}`);
+        logger.info(`Duplicate Entries: ${STATS.duplicates}`);
+        console.log('='.repeat(50) + '\n');
+
+        if (STATS.totalCourses === 0) {
+            throw new Error('No course data found! Please check the table structure.');
+        }
+
+        // Download files
+        logger.info('💾 Starting file downloads...\n');
+        const courseKeys = Object.keys(allCourses);
+        
+        for (let i = 0; i < courseKeys.length; i++) {
+            const key = courseKeys[i];
+            const courseData = allCourses[key];
+            
+            try {
+                const jsonData = {};
+                jsonData[courseData.courseCode.toLowerCase()] = courseData.entries.map(e => [
+                    courseData.section,
+                    e.room,
+                    e.teacher,
+                    e.dayDate,
+                    e.timeSlot
+                ]);
+
+                const filename = `${key.toLowerCase()}.json`;
+                await downloadJson(jsonData, filename, i * CONFIG.DOWNLOAD_DELAY);
+                
+                // Progress
+                if ((i + 1) % 10 === 0) {
+                    logger.info(`Progress: ${i + 1}/${courseKeys.length} files downloaded`);
+                }
+                
+            } catch (error) {
+                logger.error(`Failed to download: ${key}`, error.message);
+            }
+        }
+
+        // Final report
+        console.log('\n' + '='.repeat(50));
+        logger.success('🎉 EXTRACTION COMPLETE!');
+        console.log('='.repeat(50));
+        logger.info(`✓ Total Courses: ${STATS.totalCourses}`);
+        logger.success(`✓ Successful Downloads: ${STATS.successfulDownloads}`);
+        
+        if (STATS.failedDownloads > 0) {
+            logger.warning(`⚠ Failed Downloads: ${STATS.failedDownloads}`);
+        }
+        
+        if (STATS.errors.length > 0) {
+            logger.warning(`⚠ Total Errors: ${STATS.errors.length}`);
+            console.log('\nError Details:');
+            STATS.errors.slice(0, 5).forEach((err, idx) => {
+                console.log(`${idx + 1}. ${err.file || err.entry}: ${err.error}`);
+            });
+            if (STATS.errors.length > 5) {
+                console.log(`... and ${STATS.errors.length - 5} more errors`);
+            }
+        }
+        
+        console.log('='.repeat(50) + '\n');
+        alert(`✅ সফলভাবে ${STATS.successfulDownloads} টি JSON ফাইল ডাউনলোড হয়েছে!`);
+
+    } catch (error) {
+        logger.error('FATAL ERROR:', error.message);
+        alert(`❌ Error: ${error.message}`);
+        console.error('Full error:', error);
+    }
+};
+
+// Start extraction
+logger.info('Ready to extract! Starting in 1 second...\n');
+setTimeout(extractAndDownloadSchedule, 1000);
